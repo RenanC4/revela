@@ -7,7 +7,7 @@
 	objects = {
 
 /* Begin PBXFileReference section */
-		FCF24B42309F707A00042994 /* scan-analog.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "scan-analog.app"; sourceTree = BUILT_PRODUCTS_DIR; };
+		FCF24B42309F707A00042994 /* Revela.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = Revela.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
@@ -40,7 +40,7 @@
 		FCF24B43309F707A00042994 /* Products */ = {
 			isa = PBXGroup;
 			children = (
-				FCF24B42309F707A00042994 /* scan-analog.app */,
+				FCF24B42309F707A00042994 /* Revela.app */,
 			);
 			name = Products;
 			sourceTree = "<group>";
@@ -48,9 +48,9 @@
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
-		FCF24B41309F707A00042994 /* scan-analog */ = {
+		FCF24B41309F707A00042994 /* Revela */ = {
 			isa = PBXNativeTarget;
-			buildConfigurationList = FCF24B4D309F707B00042994 /* Build configuration list for PBXNativeTarget "scan-analog" */;
+			buildConfigurationList = FCF24B4D309F707B00042994 /* Build configuration list for PBXNativeTarget "Revela" */;
 			buildPhases = (
 				FCF24B3E309F707A00042994 /* Sources */,
 				FCF24B3F309F707A00042994 /* Frameworks */,
@@ -63,11 +63,11 @@
 			fileSystemSynchronizedGroups = (
 				FCF24B44309F707A00042994 /* scan-analog */,
 			);
-			name = "scan-analog";
+			name = Revela;
 			packageProductDependencies = (
 			);
 			productName = "scan-analog";
-			productReference = FCF24B42309F707A00042994 /* scan-analog.app */;
+			productReference = FCF24B42309F707A00042994 /* Revela.app */;
 			productType = "com.apple.product-type.application";
 		};
 /* End PBXNativeTarget section */
@@ -99,7 +99,7 @@
 			projectDirPath = "";
 			projectRoot = "";
 			targets = (
-				FCF24B41309F707A00042994 /* scan-analog */,
+				FCF24B41309F707A00042994 /* Revela */,
 			);
 		};
 /* End PBXProject section */
@@ -251,8 +251,11 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = XTN6F7KCSU;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSCameraUsageDescription = "O scan-analog usa a câmara traseira para tirar fotografias.";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "O scan-analog guarda o positivo na Fototeca. O RAW fica na app.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -282,8 +285,11 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 1;
+				DEVELOPMENT_TEAM = XTN6F7KCSU;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_KEY_NSCameraUsageDescription = "O scan-analog usa a câmara traseira para tirar fotografias.";
+				INFOPLIST_KEY_NSPhotoLibraryAddUsageDescription = "O scan-analog guarda o positivo na Fototeca. O RAW fica na app.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -318,7 +324,7 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Release;
 		};
-		FCF24B4D309F707B00042994 /* Build configuration list for PBXNativeTarget "scan-analog" */ = {
+		FCF24B4D309F707B00042994 /* Build configuration list for PBXNativeTarget "Revela" */ = {
 			isa = XCConfigurationList;
 			buildConfigurations = (
 				FCF24B4E309F707B00042994 /* Debug */,
