@@ -135,6 +135,29 @@ struct ContentView: View {
                         statusBanner(statusMessage)
                             .allowsHitTesting(false)
                     }
+                    if let suggested = roll.formatSuggestion, suggested != format {
+                        // Read from the detected gate's aspect on the last frame.
+                        HStack(spacing: 10) {
+                            Text("O fotograma parece \(suggested.title).")
+                                .font(.caption)
+                                .foregroundStyle(.white)
+                            Button("Mudar") {
+                                format = suggested
+                                roll.dismissFormatSuggestion()
+                            }
+                            .font(.caption.weight(.semibold))
+                            Button {
+                                roll.dismissFormatSuggestion()
+                            } label: {
+                                Image(systemName: "xmark")
+                            }
+                            .font(.caption)
+                            .accessibilityLabel("Ignorar")
+                        }
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 6)
+                        .background(.black.opacity(0.6), in: Capsule())
+                    }
                     if let message = roll.message {
                         Text(message)
                             .font(.caption2.monospaced())

@@ -7,10 +7,10 @@ import CoreImage
 import Foundation
 import ImageIO
 import os
-import UIKit
 
 nonisolated struct PreparedPositive: Sendable {
     var profile: RollProfile
+    /// The faithful density inversion. Never touched by enhancement.
     var previewJPEG: Data
     var flatFieldApplied: Bool
     var cropDetected: Bool
@@ -18,6 +18,23 @@ nonisolated struct PreparedPositive: Sendable {
     var fileBaselineExposure: Float?
     /// This frame's own black/white densities (slides: linear white in `high`), for roll-wide levels.
     var frameLevels: DensityLevels?
+    /// Format read from the detected gate's aspect (35 mm 3:2, 6×6 1:1), if a gate was found.
+    var detectedFormat: FilmFormat?
+    var enhancement: PreparedEnhancement?
+}
+
+/// Optional layer computed from the faithful positive. Separate data; the faithful JPEG is not involved.
+nonisolated struct PreparedEnhancement: Sendable {
+    var previewJPEG: Data
+    /// Red defect overlay on the faithful positive, for the debug view.
+    var maskJPEG: Data?
+    var defects: Int
+}
+
+/// Full-resolution files for one frame.
+nonisolated struct ExportedPositive: Sendable {
+    var faithful: Data
+    var enhanced: Data?
 }
 
 nonisolated private let invertLog = Logger(subsystem: "scan-analog", category: "invert")
@@ -32,6 +49,10 @@ actor NegativeProcessor {
     private var mosaicCache: [(key: String, image: CIImage)] = []
     /// DNG BaselineExposure per file, read once. ProRAW may vary it from shot to shot.
     private var fileBaselines: [URL: Float] = [:]
+    /// Gate per capture (normalised), so detection runs once per file and light.
+    private var gateCache: [String: GateDetection?] = [:]
+    /// Dust masks (normalised) per frame crop and strength; tone sliders do not invalidate them.
+    private var dustCache: [(key: String, mask: DustMask)] = []
 
     private init() {
         context = CIContext(options: [
@@ -55,22 +76,40 @@ actor NegativeProcessor {
         var radiometricScale: Float
         /// Roll median black/white densities for `AutoLevels.roll`.
         var rollLevels: DensityLevels?
+        /// Optional cleanup and look, applied after (and separately from) the faithful print.
+        var enhance: EnhanceSettings = EnhanceSettings()
+
+        /// Identity of the capture itself: file (or mosaic) plus the light it was divided by.
+        var sourceKey: String {
+            "\(mosaic?.id.uuidString ?? rawURL.path)|\(flatFieldURL?.path ?? "-")"
+        }
     }
 
-    /// Preview positive (≤1200 px) and the measurements the roll keeps.
+    /// Faithful preview (≤1200 px), optional enhanced preview, and the measurements the roll keeps.
     func prepare(_ request: FrameRequest) throws -> PreparedPositive {
-        let rendered = try render(request, maxEdge: 1200)
-        guard let preview = jpegData(from: rendered.image) else {
+        let printed = try faithful(request, maxEdge: 1200)
+        let rotated = Self.place(Self.rotate(printed.positive, quarterTurns: request.quarterTurns))
+        try checkCollapse(rotated, request: request, parameters: printed.parameters, profile: printed.source.profile)
+        guard let preview = jpegData(from: rotated) else {
             throw ProcessorError.renderFailed
         }
         return PreparedPositive(
-            profile: rendered.profile,
+            profile: printed.source.profile,
             previewJPEG: preview,
-            flatFieldApplied: rendered.source.flatFieldApplied,
-            cropDetected: rendered.source.cropDetected,
+            flatFieldApplied: printed.source.flatFieldApplied,
+            cropDetected: printed.source.cropDetected,
             fileBaselineExposure: request.mosaic == nil ? fileBaselines[request.rawURL] : nil,
-            frameLevels: rendered.source.levels
+            frameLevels: printed.source.levels,
+            detectedFormat: printed.source.gate?.format,
+            enhancement: request.enhance.doesAnything ? try enhancementPreview(request, printed: printed) : nil
         )
+    }
+
+    /// Only the enhanced preview, for when just the enhancement settings changed:
+    /// the faithful preview the roll already holds stays byte-for-byte as it was.
+    func prepareEnhancement(_ request: FrameRequest) throws -> PreparedEnhancement? {
+        guard request.enhance.doesAnything else { return nil }
+        return try enhancementPreview(request, printed: faithful(request, maxEdge: 1200))
     }
 
     /// Only the frame's black/white densities (and the roll profile, measured if missing). No print, no JPEG.
@@ -79,34 +118,56 @@ actor NegativeProcessor {
         return (source.levels, source.profile)
     }
 
-    /// Full-resolution 10-bit HEIF, with a 4500 px fallback if the encoder refuses the full size.
-    func exportHEIF(_ request: FrameRequest) throws -> Data {
+    /// The whole capture printed with this frame's settings, and the crop as a fraction of it
+    /// (top-left origin, unrotated), for the crop editor.
+    func cropEditorPreview(_ request: FrameRequest) throws -> (jpeg: Data, crop: CGRect) {
+        let source = try frameSource(request, maxEdge: 1200)
+        let parameters = printParameters(profile: source.profile, adjustments: request.adjustments, levels: levels(for: request, source: source))
+        guard let positive = applyPositive(source.full, parameters: parameters),
+              let jpeg = jpegData(from: Self.place(positive)) else { throw ProcessorError.renderFailed }
+        return (jpeg, GateDetection(gate: source.frame, format: nil, confidence: 1, skewDegrees: 0, method: "").normalized(in: source.full.extent))
+    }
+
+    /// Full-resolution 10-bit HEIF of the faithful positive, and of the enhanced one when enabled,
+    /// with a 4500 px fallback if the encoder refuses the full size.
+    func exportHEIF(_ request: FrameRequest) throws -> ExportedPositive {
         for maxEdge in [nil, CGFloat(4500)] {
-            let rendered = try render(request, maxEdge: maxEdge)
-            if let data = heif10Data(from: rendered.image) {
-                return data
+            let printed = try faithful(request, maxEdge: maxEdge)
+            let faithfulImage = Self.place(Self.rotate(printed.positive, quarterTurns: request.quarterTurns))
+            guard let faithfulData = heif10Data(from: faithfulImage) else { continue }
+            var enhancedData: Data?
+            if request.enhance.doesAnything {
+                let enhanced = try enhancedImage(request, printed: printed)
+                guard let data = heif10Data(from: Self.place(Self.rotate(enhanced.image, quarterTurns: request.quarterTurns))) else { continue }
+                enhancedData = data
             }
+            return ExportedPositive(faithful: faithfulData, enhanced: enhancedData)
         }
         throw ProcessorError.renderFailed
     }
 
-    /// Linear transmittance cropped to the frame, plus what was measured on the way.
+    /// Linear transmittance of the capture and of the frame, plus what was measured on the way.
     private struct FrameSource {
+        /// Whole capture (flat-fielded, exposure-normalised), still a negative.
+        var full: CIImage
+        var frame: CGRect
         var cropped: CIImage
         var profile: RollProfile
         var levels: DensityLevels?
         var flatFieldApplied: Bool
         var cropDetected: Bool
+        var gate: GateDetection?
     }
 
-    private struct Rendered {
-        var image: CIImage
-        var profile: RollProfile
+    /// The faithful print of the frame, unrotated, with the parameters that made it.
+    private struct Printed {
+        var positive: CIImage
+        var parameters: PrintParameters
         var source: FrameSource
     }
 
-    /// Decode (or assemble the mosaic), flat-field, normalise exposure, measure the roll profile if needed,
-    /// find the frame and measure its levels. Everything before the print.
+    /// Decode (or assemble the mosaic), flat-field, normalise exposure, find the gate on the
+    /// uninverted negative, measure Dmin from the rebate ring (once per roll), crop, measure levels.
     private func frameSource(_ request: FrameRequest, maxEdge: CGFloat?) throws -> FrameSource {
         var source: CIImage
         var flatFieldApplied = false
@@ -143,24 +204,36 @@ actor NegativeProcessor {
             ])
         }
 
+        let guide = GuideMapping.imageRect(
+            viewRect: geometry.inner,
+            viewSize: geometry.viewSize,
+            extent: source.extent
+        ).intersection(source.extent).integral
+        let gate = gateDetection(in: source, request: request, geometry: geometry, guide: guide)
+
         let profile = try profileFor(
             filmType: filmType,
             existing: request.profile,
             transmittance: source,
             geometry: geometry,
-            clearBase: request.mosaic == nil ? request.clearBase : nil
+            clearBase: request.mosaic == nil ? request.clearBase : nil,
+            gate: gate
         )
         let adjustments = request.adjustments
-        var frame = GuideMapping.imageRect(
-            viewRect: geometry.inner,
-            viewSize: geometry.viewSize,
-            extent: source.extent
-        ).intersection(source.extent).integral
+        var frame = guide
         var cropDetected = false
-        if adjustments.autoCrop,
-           let found = detectFrame(in: source, geometry: geometry, profile: profile, guide: frame) {
-            frame = found
-            cropDetected = true
+        if let manual = adjustments.manualCrop {
+            frame = GateDetection.denormalize(manual, in: source.extent).intersection(source.extent).integral
+        } else if adjustments.autoCrop {
+            if let gate {
+                // A hair inside the detected edge, so no rebate line survives the crop.
+                frame = gate.gate.insetBy(dx: gate.gate.width * 0.004, dy: gate.gate.height * 0.004)
+                    .intersection(source.extent).integral
+                cropDetected = true
+            } else if let found = detectFrame(in: source, geometry: geometry, profile: profile, guide: guide) {
+                frame = found
+                cropDetected = true
+            }
         }
         if abs(adjustments.cropInset) > 0.0005 {
             // Positive trims inward; negative widens to keep a thin rebate.
@@ -176,47 +249,137 @@ actor NegativeProcessor {
             ? densityStats(in: cropped, silver: filmType == .silverBW)
             : slideWhite(in: cropped).map { DensityLevels(low: .zero, high: RGBColor(r: $0, g: $0, b: $0)) }
         return FrameSource(
+            full: source,
+            frame: frame,
             cropped: cropped,
             profile: profile,
             levels: levels,
             flatFieldApplied: flatFieldApplied,
-            cropDetected: cropDetected
+            cropDetected: cropDetected,
+            gate: gate
         )
     }
 
-    private func render(_ request: FrameRequest, maxEdge: CGFloat?) throws -> Rendered {
-        let source = try frameSource(request, maxEdge: maxEdge)
-        var profile = source.profile
-        let adjustments = request.adjustments
-        let levels: DensityLevels?
-        switch adjustments.autoLevels {
-        case .roll: levels = request.rollLevels ?? source.levels
-        case .frame: levels = source.levels
-        case .off: levels = nil
+    /// Vision rectangle detection on a density proxy of the uninverted negative, cached per capture.
+    private func gateDetection(in source: CIImage, request: FrameRequest, geometry: CaptureGeometry, guide: CGRect) -> GateDetection? {
+        let key = request.sourceKey
+        if let cached = gateCache[key] {
+            return cached.map { detection in
+                var placed = detection
+                placed.gate = GateDetection.denormalize(detection.gate, in: source.extent)
+                return placed
+            }
         }
-        let parameters = printParameters(profile: profile, adjustments: adjustments, levels: levels)
+        var found: GateDetection?
+        let bitmap = linearBitmap(of: source, in: source.extent, longest: 1024)
+        if bitmap.width > 64, bitmap.height > 64 {
+            let density = bitmap.pixels.map { -log10(max(0.2627 * $0.r + 0.6780 * $0.g + 0.0593 * $0.b, 1e-4)) }
+            let low = percentileValue(density, 0.01)
+            let high = max(percentileValue(density, 0.99), low + 1e-3)
+            let bytes = density.map { UInt8(min(max(($0 - low) / (high - low), 0), 1) * 255) }
+            if let provider = CGDataProvider(data: Data(bytes) as CFData),
+               let proxy = CGImage(
+                   width: bitmap.width, height: bitmap.height, bitsPerComponent: 8, bitsPerPixel: 8,
+                   bytesPerRow: bitmap.width, space: CGColorSpaceCreateDeviceGray(),
+                   bitmapInfo: CGBitmapInfo(rawValue: 0), provider: provider, decode: nil,
+                   shouldInterpolate: false, intent: .defaultIntent
+               ) {
+                found = FrameDetector.detectGate(proxy: proxy, extent: source.extent, expected: geometry.format, guide: guide)
+            }
+        }
+        gateCache[key] = found.map { detection in
+            var normalized = detection
+            normalized.gate = detection.normalized(in: source.extent)
+            return normalized
+        }
+        if gateCache.count > 64 { gateCache.removeAll() }
+        return found
+    }
+
+    private func levels(for request: FrameRequest, source: FrameSource) -> DensityLevels? {
+        switch request.adjustments.autoLevels {
+        case .roll: return request.rollLevels ?? source.levels
+        case .frame: return source.levels
+        case .off: return nil
+        }
+    }
+
+    /// The faithful density inversion of the frame, unrotated. This is the reference image:
+    /// enhancement only ever reads it.
+    private func faithful(_ request: FrameRequest, maxEdge: CGFloat?) throws -> Printed {
+        let source = try frameSource(request, maxEdge: maxEdge)
+        let parameters = printParameters(profile: source.profile, adjustments: request.adjustments, levels: levels(for: request, source: source))
         guard let positive = applyPositive(source.cropped, parameters: parameters) else {
             throw ProcessorError.renderFailed
         }
-        let rotated = Self.rotate(positive, quarterTurns: request.quarterTurns)
-        let origin = rotated.extent.origin
-        let placed = rotated.transformed(by: CGAffineTransform(translationX: -origin.x, y: -origin.y))
-        if request.filmType.inverts, var stretch = profile.stretch {
-            stretch.rebateCode = parameters.code(atStretched: 0)
-            stretch.highlightCode = parameters.code(atStretched: 1)
-            let spread = try outputSpread(of: placed)
-            stretch.outputLow = spread.low
-            stretch.outputHigh = spread.high
-            profile.stretch = stretch
-            invertLog.info("\(stretch.rangeText, privacy: .public)")
-            let mid = (spread.low + spread.high) * 0.5
-            let curveBroken = adjustments.isNeutralTone
-                && (stretch.rebateCode > 15 || stretch.highlightCode < 200)
-            if curveBroken || (spread.high - spread.low < 20 && mid > 40 && mid < 220) {
-                throw ProcessorError.collapsed(stretch)
+        return Printed(positive: positive, parameters: parameters, source: source)
+    }
+
+    /// Collapse checks on the faithful print (unchanged behaviour).
+    private func checkCollapse(_ placed: CIImage, request: FrameRequest, parameters: PrintParameters, profile: RollProfile) throws {
+        guard request.filmType.inverts, var stretch = profile.stretch else { return }
+        stretch.rebateCode = parameters.code(atStretched: 0)
+        stretch.highlightCode = parameters.code(atStretched: 1)
+        let spread = try outputSpread(of: placed)
+        stretch.outputLow = spread.low
+        stretch.outputHigh = spread.high
+        invertLog.info("\(stretch.rangeText, privacy: .public)")
+        let mid = (spread.low + spread.high) * 0.5
+        let curveBroken = request.adjustments.isNeutralTone
+            && (stretch.rebateCode > 15 || stretch.highlightCode < 200)
+        if curveBroken || (spread.high - spread.low < 20 && mid > 40 && mid < 220) {
+            throw ProcessorError.collapsed(stretch)
+        }
+    }
+
+    // MARK: Enhancement (reads the faithful print, never writes it)
+
+    private func enhancementPreview(_ request: FrameRequest, printed: Printed) throws -> PreparedEnhancement {
+        let enhanced = try enhancedImage(request, printed: printed)
+        let turns = request.quarterTurns
+        guard let jpeg = jpegData(from: Self.place(Self.rotate(enhanced.image, quarterTurns: turns))) else {
+            throw ProcessorError.renderFailed
+        }
+        let maskJPEG = enhanced.mask.flatMap { mask in
+            jpegData(from: Self.place(Self.rotate(Enhancement.maskOverlay(printed.positive, mask: mask), quarterTurns: turns)))
+        }
+        return PreparedEnhancement(previewJPEG: jpeg, maskJPEG: maskJPEG, defects: enhanced.mask?.defects ?? 0)
+    }
+
+    /// Faithful → dust/scratch fill (mask only) → film look.
+    private func enhancedImage(_ request: FrameRequest, printed: Printed) throws -> (image: CIImage, mask: DustMask?) {
+        var image = printed.positive
+        var mask: DustMask?
+        if request.enhance.dust != .off {
+            mask = try dustMask(request)
+            if let mask {
+                image = Enhancement.removeDust(from: image, mask: mask)
             }
         }
-        return Rendered(image: placed, profile: profile, source: source)
+        image = Enhancement.applyLook(request.enhance.look, to: image)
+        return (image, mask)
+    }
+
+    /// Detected once per crop and strength at a fixed analysis size (≤3000 px), so preview and
+    /// full-resolution export clean exactly the same defects.
+    private func dustMask(_ request: FrameRequest) throws -> DustMask? {
+        let crop = request.adjustments.manualCrop.map { "\($0)" } ?? "auto\(request.adjustments.autoCrop)\(request.adjustments.cropInset)"
+        let key = "\(request.sourceKey)|\(crop)|\(request.enhance.dust.rawValue)|\(request.adjustments.autoLevels.rawValue)"
+        if let cached = dustCache.first(where: { $0.key == key }) {
+            return cached.mask
+        }
+        let analysis = try faithful(request, maxEdge: 3000)
+        guard let mask = Enhancement.detectDust(in: analysis.positive, strength: request.enhance.dust, context: context) else {
+            return nil
+        }
+        dustCache.append((key, mask))
+        if dustCache.count > 8 { dustCache.removeFirst() }
+        return mask
+    }
+
+    private static func place(_ image: CIImage) -> CIImage {
+        let origin = image.extent.origin
+        return image.transformed(by: CGAffineTransform(translationX: -origin.x, y: -origin.y))
     }
 
     /// Small mosaics are cached as bitmaps so slider changes do not re-decode four RAWs.
@@ -569,7 +732,8 @@ actor NegativeProcessor {
         existing: RollProfile?,
         transmittance: CIImage,
         geometry: CaptureGeometry,
-        clearBase: CGPoint?
+        clearBase: CGPoint?,
+        gate: GateDetection?
     ) throws -> RollProfile {
         if let existing, existing.filmType == filmType {
             return existing
@@ -587,19 +751,31 @@ actor NegativeProcessor {
             filmType: filmType,
             in: transmittance,
             geometry: geometry,
-            clearBase: clearBase
+            clearBase: clearBase,
+            gate: gate
         )
     }
 
     /// Dmin is the robust median density of the unexposed rebate (or a tapped clear-base patch).
     /// The picture is never the mask. Dmax is the 99.8th percentile of density inside the gate.
+    /// With a detected gate, the rebate is the ring just outside it; otherwise the guide's rebate bands.
     private func measure(
         filmType: FilmType,
         in image: CIImage,
         geometry: CaptureGeometry,
-        clearBase: CGPoint?
+        clearBase: CGPoint?,
+        gate: GateDetection?
     ) throws -> RollProfile {
         let rebate: SampleSet
+        let warm = filmType != .silverBW
+        let detectedRebate = gate.flatMap { detection -> SampleSet? in
+            let rects = FrameDetector.rebateRects(
+                around: detection.gate,
+                format: detection.format ?? geometry.format,
+                within: image.extent
+            )
+            return baseCluster(samples(in: image, imageRects: rects, rejectHoles: false), warm: warm)
+        }
         if let clearBase {
             let patch = clearBaseRect(clearBase, viewSize: geometry.viewSize)
             guard let sampled = tappedBase(
@@ -608,26 +784,26 @@ actor NegativeProcessor {
                 throw ProcessorError.unevenBase
             }
             rebate = sampled
+        } else if let detectedRebate {
+            rebate = detectedRebate
         } else {
             guard let sampled = baseCluster(
                 samples(in: image, viewRects: baseViewRects(geometry), geometry: geometry, rejectHoles: false),
-                warm: filmType != .silverBW
+                warm: warm
             ) else {
                 throw ProcessorError.missingRebate
             }
             rebate = sampled
         }
 
-        let gateRect = geometry.inner.insetBy(
-            dx: geometry.inner.width * 0.015,
-            dy: geometry.inner.height * 0.015
-        )
-        guard let gate = samples(
-            in: image,
-            viewRects: [gateRect.width > 2 ? gateRect : geometry.inner],
-            geometry: geometry,
-            rejectHoles: false
-        ), gate.count >= 24 else {
+        // Dmax from inside the picture only (detected gate, else the guide), a small border excluded.
+        let pictureRect: CGRect = gate.map { $0.gate.insetBy(dx: $0.gate.width * 0.015, dy: $0.gate.height * 0.015) }
+            ?? GuideMapping.imageRect(
+                viewRect: geometry.inner.insetBy(dx: geometry.inner.width * 0.015, dy: geometry.inner.height * 0.015),
+                viewSize: geometry.viewSize,
+                extent: image.extent
+            )
+        guard let gate = samples(in: image, imageRects: [pictureRect], rejectHoles: false), gate.count >= 24 else {
             throw ProcessorError.renderFailed
         }
 
@@ -698,19 +874,11 @@ actor NegativeProcessor {
         )
     }
 
-    /// Rebate bands plus a thin lip inside the gate, so a small misalignment still hits the film base.
+    /// The guide's rebate bands only. Nothing inside the picture area is ever sampled for Dmin.
     private func baseViewRects(_ geometry: CaptureGeometry) -> [CGRect] {
-        let bands = geometry.layout.rebateRects(sidesOnly: false).map { coreOfRebate($0, fraction: 0.08) }
-        let inner = geometry.inner
-        let dx = inner.width * 0.05
-        let dy = inner.height * 0.05
-        let lips = [
-            CGRect(x: inner.minX, y: inner.minY, width: inner.width, height: dy),
-            CGRect(x: inner.minX, y: inner.maxY - dy, width: inner.width, height: dy),
-            CGRect(x: inner.minX, y: inner.minY, width: dx, height: inner.height),
-            CGRect(x: inner.maxX - dx, y: inner.minY, width: dx, height: inner.height),
-        ]
-        return (bands + lips).filter { $0.width >= 2 && $0.height >= 2 }
+        geometry.layout.rebateRects(sidesOnly: false)
+            .map { coreOfRebate($0, fraction: 0.08) }
+            .filter { $0.width >= 2 && $0.height >= 2 }
     }
 
     /// Clearest film in the border. Picture spill is darker, so it stays out of this cluster.
@@ -865,14 +1033,17 @@ actor NegativeProcessor {
         geometry: CaptureGeometry,
         rejectHoles: Bool
     ) -> SampleSet? {
+        let rects = viewRects.map {
+            GuideMapping.imageRect(viewRect: $0, viewSize: geometry.viewSize, extent: image.extent)
+        }
+        return samples(in: image, imageRects: rects, rejectHoles: rejectHoles)
+    }
+
+    private func samples(in image: CIImage, imageRects: [CGRect], rejectHoles: Bool) -> SampleSet? {
         var set = SampleSet()
-        for viewRect in viewRects {
-            let rect = GuideMapping.imageRect(
-                viewRect: viewRect,
-                viewSize: geometry.viewSize,
-                extent: image.extent
-            ).intersection(image.extent)
-            guard rect.width >= 2, rect.height >= 2 else { continue }
+        for imageRect in imageRects {
+            let rect = imageRect.intersection(image.extent)
+            guard !rect.isNull, rect.width >= 2, rect.height >= 2 else { continue }
             let pixels = linearPixels(of: image, in: rect, longest: rejectHoles ? 96 : 180)
             for sample in pixels {
                 let peak = max(sample.r, sample.g, sample.b)

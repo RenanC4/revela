@@ -32,6 +32,17 @@ struct RollFrame: Identifiable {
     var libraryStale = false
     /// Bumped on every change to the print, so an export started earlier cannot mark it up to date.
     var revision = 0
+    /// Optional cleanup and look. Off by default; the faithful positive is always kept.
+    var enhance = EnhanceSettings()
+    var enhancedJPEG: Data?
+    var enhancedPreview: UIImage?
+    var maskPreview: UIImage?
+    var defects = 0
+    /// 35 mm / 6×6 read from the detected gate.
+    var detectedFormat: FilmFormat?
+    /// Full-resolution files written for this frame (faithful always, enhanced when enabled).
+    var faithfulFile: URL?
+    var enhancedFile: URL?
 
     /// Exposure that shot this frame (a mosaic's tiles share one lock).
     var exposureLock: CaptureLock? { mosaic?.tiles.first?.lock ?? lock }
@@ -53,6 +64,8 @@ final class RollSession: ObservableObject {
     /// Stops the locked exposure could rise before the brightest raw value (bare light, or the
     /// rebate and sprocket holes) nears clipping. Negative when it already clips.
     @Published private(set) var exposureHeadroomEV: Double?
+    /// The gate on the last single frame looked like another format than the one selected.
+    @Published private(set) var formatSuggestion: FilmFormat?
 
     var onNewRoll: (() -> Void)?
 
@@ -65,6 +78,9 @@ final class RollSession: ObservableObject {
     private var generation = 0
     private var rollToken = 0
     private var frameTokens: [UUID: Int] = [:]
+    private var enhanceTokens: [UUID: Int] = [:]
+    /// Enhancement choices new frames start with: off until the user turns it on once.
+    private var enhanceDefaults = EnhanceSettings()
 
     init() {
         rollDirectory = Self.makeDirectory()
@@ -100,7 +116,8 @@ final class RollSession: ObservableObject {
             id: UUID(),
             rawURL: record.directory.appendingPathComponent(MosaicRecord.fileName),
             geometry: geometry,
-            mosaic: record
+            mosaic: record,
+            enhance: enhanceDefaults
         )
         frames.append(frame)
         integrate(frame.id)
@@ -116,7 +133,7 @@ final class RollSession: ObservableObject {
             message = "Não foi possível guardar o RAW."
             return
         }
-        frames.append(RollFrame(id: id, rawURL: url, geometry: geometry, lock: lock))
+        frames.append(RollFrame(id: id, rawURL: url, geometry: geometry, lock: lock, enhance: enhanceDefaults))
         if flatFieldURL == nil, exposureHeadroomEV == nil {
             measureHeadroom(url: url, angle: geometry.angle, geometry: geometry)
         }
@@ -178,6 +195,7 @@ final class RollSession: ObservableObject {
         flatFieldLock = nil
         hasFlatField = false
         exposureHeadroomEV = nil
+        formatSuggestion = nil
         clearBase = nil
         needsClearBase = false
         message = nil
@@ -212,6 +230,69 @@ final class RollSession: ObservableObject {
         scheduleFrame(frameID, delay: 0)
     }
 
+    /// Enhancement changed: only the enhanced preview is recomputed. The faithful preview is not
+    /// re-rendered, so switching Enhance off shows exactly the same faithful bytes as before.
+    func setEnhance(_ settings: EnhanceSettings, for frameID: UUID) {
+        guard let current = frames.first(where: { $0.id == frameID }), current.enhance != settings else { return }
+        enhanceDefaults = settings
+        update(frameID) { item in
+            item.enhance = settings
+            item.revision += 1
+            item.libraryStale = item.savedToLibrary
+            if !settings.doesAnything {
+                item.enhancedJPEG = nil
+                item.enhancedPreview = nil
+                item.maskPreview = nil
+                item.defects = 0
+            }
+        }
+        guard settings.doesAnything else { return }
+        let token = (enhanceTokens[frameID] ?? 0) + 1
+        enhanceTokens[frameID] = token
+        let generation = generation
+        Task {
+            try? await Task.sleep(for: .milliseconds(120))
+            guard enhanceTokens[frameID] == token, generation == self.generation,
+                  let frame = frames.first(where: { $0.id == frameID }) else { return }
+            update(frameID) { $0.isProcessing = true }
+            do {
+                let enhancement = try await NegativeProcessor.shared.prepareEnhancement(request(for: frame))
+                guard enhanceTokens[frameID] == token, generation == self.generation else { return }
+                update(frameID) { item in
+                    Self.store(enhancement, in: &item)
+                    item.isProcessing = false
+                }
+            } catch {
+                update(frameID) { $0.isProcessing = false }
+                report(error)
+            }
+        }
+    }
+
+    /// User-dragged crop (fraction of the capture, top-left origin, unrotated); nil returns to detection.
+    func setManualCrop(_ crop: CGRect?, for frameID: UUID) {
+        guard var adjustments = frames.first(where: { $0.id == frameID })?.adjustments else { return }
+        adjustments.manualCrop = crop
+        setAdjustments(adjustments, for: frameID)
+    }
+
+    /// Whole capture printed with this frame's settings, plus its current crop, for the crop editor.
+    func cropEditorPreview(for frameID: UUID) async -> (image: UIImage, crop: CGRect)? {
+        guard let frame = frames.first(where: { $0.id == frameID }),
+              let result = try? await NegativeProcessor.shared.cropEditorPreview(request(for: frame)),
+              let image = UIImage(data: result.jpeg) else { return nil }
+        return (image, result.crop)
+    }
+
+    func dismissFormatSuggestion() { formatSuggestion = nil }
+
+    private static func store(_ enhancement: PreparedEnhancement?, in item: inout RollFrame) {
+        item.enhancedJPEG = enhancement?.previewJPEG
+        item.enhancedPreview = enhancement.flatMap { UIImage(data: $0.previewJPEG) }
+        item.maskPreview = enhancement?.maskJPEG.flatMap { UIImage(data: $0) }
+        item.defects = enhancement?.defects ?? 0
+    }
+
     func resetAdjustments(frameID: UUID) {
         setAdjustments(.neutral, for: frameID)
     }
@@ -223,7 +304,10 @@ final class RollSession: ObservableObject {
             guard frame.adjustments != source.adjustments || frame.quarterTurns != source.quarterTurns else { continue }
             update(frame.id) { item in
                 item.adjustments = source.adjustments
+                // A dragged crop belongs to one capture; the others keep finding their own.
+                item.adjustments.manualCrop = frame.adjustments.manualCrop
                 item.quarterTurns = source.quarterTurns
+                item.enhance = source.enhance
                 item.revision += 1
                 item.libraryStale = item.savedToLibrary
             }
@@ -265,7 +349,8 @@ final class RollSession: ObservableObject {
             quarterTurns: frame.quarterTurns,
             mosaic: frame.mosaic,
             radiometricScale: radiometricScale(for: frame),
-            rollLevels: rollLevels
+            rollLevels: rollLevels,
+            enhance: frame.enhance
         )
     }
 
@@ -394,7 +479,12 @@ final class RollSession: ObservableObject {
                 }
                 message = Self.exposureText(frame.lock, baseline: rendered.fileBaselineExposure, frames: frames) + text
             }
+            if frame.mosaic == nil, let detected = rendered.detectedFormat, detected != frame.geometry.format {
+                formatSuggestion = detected
+            }
             update(frameID) { item in
+                item.detectedFormat = rendered.detectedFormat
+                Self.store(rendered.enhancement, in: &item)
                 item.frameLevels = item.frameLevels ?? rendered.frameLevels
                 item.fileBaselineExposure = rendered.fileBaselineExposure
                 item.previewJPEG = rendered.previewJPEG
@@ -434,9 +524,22 @@ final class RollSession: ObservableObject {
         defer { exportingFrameIDs.remove(frameID) }
         let revision = frame.revision
         do {
-            let heif = try await NegativeProcessor.shared.exportHEIF(request(for: frame))
+            let exported = try await NegativeProcessor.shared.exportHEIF(request(for: frame))
             guard generation == self.generation else { return }
-            let identifier = await saveToLibrary(heif, replacing: frame.assetIdentifier)
+            // Both versions live next to the RAW; the faithful file is only ever written by the faithful render.
+            let faithfulFile = rollDirectory.appendingPathComponent("\(frame.id.uuidString)-faithful.heic")
+            try exported.faithful.write(to: faithfulFile, options: .atomic)
+            var enhancedFile: URL?
+            if let enhanced = exported.enhanced {
+                let url = rollDirectory.appendingPathComponent("\(frame.id.uuidString)-enhanced.heic")
+                try enhanced.write(to: url, options: .atomic)
+                enhancedFile = url
+            }
+            update(frameID) { item in
+                item.faithfulFile = faithfulFile
+                item.enhancedFile = enhancedFile
+            }
+            let identifier = await saveToLibrary(exported.enhanced ?? exported.faithful, replacing: frame.assetIdentifier)
             guard generation == self.generation else { return }
             update(frameID) { item in
                 item.savedToLibrary = identifier != nil || item.savedToLibrary

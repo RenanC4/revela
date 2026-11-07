@@ -81,7 +81,7 @@ private struct FrameThumbnail: View {
         Color.black
             .aspectRatio(1, contentMode: .fit)
             .overlay {
-                if let preview = frame.preview {
+                if let preview = frame.enhance.doesAnything ? (frame.enhancedPreview ?? frame.preview) : frame.preview {
                     Image(uiImage: preview)
                         .resizable()
                         .scaledToFill()
@@ -107,6 +107,8 @@ private struct FrameDetailView: View {
     let frameID: UUID
     @Environment(\.dismiss) private var dismiss
     @State private var showsInfo = false
+    @State private var showsMask = false
+    @State private var showsCrop = false
 
     private var frame: RollFrame? {
         roll.frames.first { $0.id == frameID }
@@ -120,20 +122,25 @@ private struct FrameDetailView: View {
         VStack(spacing: 12) {
             ZStack {
                 Color.black
-                if let preview = frame?.preview {
-                    Image(uiImage: preview)
-                        .resizable()
-                        .scaledToFit()
-                        .overlay(alignment: .topTrailing) {
-                            if frame?.isProcessing == true {
-                                ProgressView()
-                                    .tint(.white)
-                                    .padding(8)
-                            }
-                        }
+                if let frame, let preview = frame.preview {
+                    if frame.enhance.doesAnything, let enhanced = frame.enhancedPreview {
+                        BeforeAfterView(before: preview, after: enhanced, mask: showsMask ? frame.maskPreview : nil)
+                    } else {
+                        // The faithful positive, exactly as rendered.
+                        Image(uiImage: preview)
+                            .resizable()
+                            .scaledToFit()
+                    }
                 } else {
                     ProgressView()
                         .tint(.white)
+                }
+            }
+            .overlay(alignment: .topTrailing) {
+                if frame?.isProcessing == true, frame?.preview != nil {
+                    ProgressView()
+                        .tint(.white)
+                        .padding(8)
                 }
             }
             .frame(maxHeight: .infinity)
@@ -144,6 +151,12 @@ private struct FrameDetailView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
+                Button {
+                    showsCrop = true
+                } label: {
+                    Image(systemName: "crop")
+                }
+                .accessibilityLabel("Ajustar recorte")
                 Button {
                     roll.rotate(frameID: frameID)
                 } label: {
@@ -167,6 +180,49 @@ private struct FrameDetailView: View {
         }
         .onChange(of: roll.frames.isEmpty) { _, empty in
             if empty { dismiss() }
+        }
+        .sheet(isPresented: $showsCrop) {
+            CropEditorView(roll: roll, frameID: frameID)
+        }
+    }
+
+    private var enhance: EnhanceSettings {
+        frame?.enhance ?? EnhanceSettings()
+    }
+
+    private func enhanceBinding<Value>(_ keyPath: WritableKeyPath<EnhanceSettings, Value>) -> Binding<Value> {
+        Binding(
+            get: { enhance[keyPath: keyPath] },
+            set: { value in
+                var next = enhance
+                next[keyPath: keyPath] = value
+                roll.setEnhance(next, for: frameID)
+            }
+        )
+    }
+
+    /// Optional layer: off shows and saves the faithful inversion only.
+    private var enhanceSection: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Toggle("Melhorar · pó e look", isOn: enhanceBinding(\.enabled))
+                .font(.subheadline)
+                .foregroundStyle(.white)
+                .tint(.white)
+            if enhance.enabled {
+                Picker("Pó e riscos", selection: enhanceBinding(\.dust)) {
+                    ForEach(DustStrength.allCases) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                Picker("Look", selection: enhanceBinding(\.look)) {
+                    ForEach(FilmLook.available(for: roll.filmType)) { Text($0.title).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                Toggle("Mostrar máscara do pó · \(frame?.defects ?? 0) defeitos", isOn: $showsMask)
+                    .font(.caption)
+                    .foregroundStyle(.white)
+                    .tint(.red)
+                    .disabled(enhance.dust == .off)
+            }
         }
     }
 
@@ -222,6 +278,8 @@ private struct FrameDetailView: View {
 
             ScrollView {
                 VStack(spacing: 10) {
+                    enhanceSection
+                    Divider().overlay(.white.opacity(0.2))
                     slider("Exposição", \.exposure, -2...2, format: "%+.1f EV")
                     slider("Contraste", \.contrast, 0.5...1.8, format: "%.2f")
                     slider("Altas luzes", \.highlights, -1...1, format: "%+.2f")

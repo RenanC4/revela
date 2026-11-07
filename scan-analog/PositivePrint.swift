@@ -58,6 +58,9 @@ nonisolated struct Adjustments: Sendable, Equatable {
     var autoCrop = true
     /// Extra crop as a fraction of the frame: positive trims, negative keeps a thin rebate.
     var cropInset: Double = 0
+    /// Crop the user dragged, as a fraction of the uncropped capture (top-left origin, unrotated).
+    /// Overrides detection; nil means automatic.
+    var manualCrop: CGRect?
 
     static let neutral = Adjustments()
 
